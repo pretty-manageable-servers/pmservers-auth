@@ -639,6 +639,23 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect to local Supabase");
+        let auth_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v1/admin/generate_link"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "properties": {"hashed_token":"integration-hash"}
+            })))
+            .expect(1)
+            .mount(&auth_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v1/verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token":"integration-access","refresh_token":"integration-refresh"
+            })))
+            .expect(1)
+            .mount(&auth_server)
+            .await;
         let prefix = format!("it-{}", hash(&new_code()));
         let approved_code = format!("{}-A", &prefix[..12]);
         let expired_code = format!("{}-E", &prefix[..12]);
@@ -690,6 +707,22 @@ mod tests {
             usize::from(first_claim.is_some()) + usize::from(second_claim.is_some()),
             1
         );
+        let mut session_count = 0;
+        for claim_result in [first_claim, second_claim] {
+            if claim_result.is_some() {
+                create_supabase_session(
+                    &reqwest::Client::new(),
+                    &auth_server.uri(),
+                    "anon-key",
+                    "service-key",
+                    "integration@example.com",
+                )
+                .await
+                .unwrap();
+                session_count += 1;
+            }
+        }
+        assert_eq!(session_count, 1);
 
         let expired_claim = sqlx::query_scalar::<_, String>(
             "UPDATE device_logins
@@ -714,12 +747,15 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let denied_status: String =
-            sqlx::query_scalar("SELECT status FROM device_logins WHERE user_code = $1")
-                .bind(&denied_code)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let denied_status: String = sqlx::query_scalar(
+            "SELECT status
+             FROM device_logins
+             WHERE user_code = $1",
+        )
+        .bind(&denied_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(denied_status, "denied");
 
         sqlx::query(
@@ -740,11 +776,14 @@ mod tests {
         .unwrap();
         assert!(should_slow_down(Some(seconds_since_poll)));
 
-        sqlx::query("DELETE FROM device_logins WHERE user_code = ANY($1)")
-            .bind([&approved_code, &expired_code, &denied_code, &slow_code])
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "DELETE FROM device_logins
+             WHERE user_code = ANY($1)",
+        )
+        .bind([&approved_code, &expired_code, &denied_code, &slow_code])
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 }
 
@@ -757,16 +796,22 @@ async fn main() {
         .connect(&database)
         .await
         .expect("database connection failed");
-    let _ = sqlx::query("DELETE FROM device_logins WHERE expires_at <= now()")
-        .execute(&pool)
-        .await;
+    let _ = sqlx::query(
+        "DELETE FROM device_logins
+         WHERE expires_at <= now()",
+    )
+    .execute(&pool)
+    .await;
     let cleanup = pool.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(3600)).await;
-            let _ = sqlx::query("DELETE FROM device_logins WHERE expires_at <= now()")
-                .execute(&cleanup)
-                .await;
+            let _ = sqlx::query(
+                "DELETE FROM device_logins
+                 WHERE expires_at <= now()",
+            )
+            .execute(&cleanup)
+            .await;
         }
     });
     let app = Arc::new(App {
