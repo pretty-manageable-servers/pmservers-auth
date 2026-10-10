@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pmservers-auth
+  namespace: pms
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: pmservers-auth}
+  template:
+    metadata:
+      labels: {app: pmservers-auth}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: auth
+          image: pmservers-auth:dev
+          ports:
+            - {name: http, containerPort: 8080}
+          envFrom:
+            - secretRef: {name: pms-auth-env}
+          env:
+            - {name: PUBLIC_URL, value: https://auth.pmservers.org}
+          readinessProbe:
+            httpGet: {path: /livez, port: http}
+          livenessProbe:
+            httpGet: {path: /livez, port: http}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pmservers-auth
+  namespace: pms
+spec:
+  selector: {app: pmservers-auth}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: pmservers-auth
+  namespace: pms
+spec:
+  entryPoints: [tunnel]
+  tls: {}
+  routes:
+    - match: Host(`auth.pmservers.org`)
+      kind: Rule
+      services:
+        - name: pmservers-auth
+          port: 8080

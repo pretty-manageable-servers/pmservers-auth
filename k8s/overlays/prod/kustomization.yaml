@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: pmservers-auth
+    newName: ghcr.io/pretty-manageable-servers/pmservers-auth
+    newTag: sha-pending
+patches:
+  - target: {kind: Deployment, name: pmservers-auth}
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{name: ghcr-pull}]
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 500m, memory: 256Mi}}
