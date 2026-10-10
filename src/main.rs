@@ -741,7 +741,7 @@ mod tests {
         assert!(should_slow_down(Some(seconds_since_poll)));
 
         sqlx::query("DELETE FROM device_logins WHERE user_code = ANY($1)")
-            .bind(&[&approved_code, &expired_code, &denied_code, &slow_code])
+            .bind([&approved_code, &expired_code, &denied_code, &slow_code])
             .execute(&pool)
             .await
             .unwrap();
