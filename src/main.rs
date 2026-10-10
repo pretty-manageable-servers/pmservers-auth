@@ -203,7 +203,7 @@ async fn approve(
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, err("invalid_token")))?;
     let result = sqlx::query(
         "UPDATE device_logins
-         SET user_id = $1, status = 'approved'
+         SET user_id = $1::uuid, status = 'approved'
          WHERE user_code = $2 AND status = 'pending'
            AND expires_at > now()",
     )
@@ -490,6 +490,19 @@ async fn livez() -> StatusCode {
     StatusCode::OK
 }
 
+fn router(app: Arc<App>) -> Router {
+    Router::new()
+        .route("/", get(page))
+        .route("/{user_code}", get(page))
+        .route("/device", post(start))
+        .route("/device/info", post(info))
+        .route("/device/approve", post(approve))
+        .route("/device/deny", post(deny))
+        .route("/device/token", post(poll))
+        .route("/livez", get(livez))
+        .with_state(app)
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -629,161 +642,187 @@ mod tests {
         assert_eq!(session["refresh_token"], "refresh");
     }
 
+    /// Runs the real routes against local Supabase (`supabase start` in pmservers-api).
     #[tokio::test]
     #[ignore = "requires local Supabase with 0010_device_logins.sql applied"]
-    async fn local_supabase_sql_allows_one_claim_and_checks_expiry_deny_and_poll_interval() {
-        let database_url = std::env::var("LOCAL_SUPABASE_DATABASE_URL")
-            .expect("set LOCAL_SUPABASE_DATABASE_URL to the local Supabase database URL");
+    async fn local_supabase_device_login_end_to_end() {
+        let setting = |name: &str| {
+            std::env::var(name).unwrap_or_else(|_| panic!("set {name} for the local Supabase"))
+        };
+        let supabase_url = setting("LOCAL_SUPABASE_URL");
+        let anon_key = setting("LOCAL_SUPABASE_ANON_KEY");
+        let service_key = setting("LOCAL_SUPABASE_SERVICE_ROLE_KEY");
         let pool = PgPoolOptions::new()
             .max_connections(4)
-            .connect(&database_url)
+            .connect(&setting("LOCAL_SUPABASE_DATABASE_URL"))
             .await
             .expect("connect to local Supabase");
-        let auth_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/auth/v1/admin/generate_link"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "properties": {"hashed_token":"integration-hash"}
-            })))
-            .expect(1)
-            .mount(&auth_server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/auth/v1/verify"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token":"integration-access","refresh_token":"integration-refresh"
-            })))
-            .expect(1)
-            .mount(&auth_server)
-            .await;
-        let prefix = format!("it-{}", hash(&new_code()));
-        let approved_code = format!("{}-A", &prefix[..12]);
-        let expired_code = format!("{}-E", &prefix[..12]);
-        let denied_code = format!("{}-D", &prefix[..12]);
-        let slow_code = format!("{}-S", &prefix[..12]);
+        let app = Arc::new(App {
+            pool: pool.clone(),
+            http: reqwest::Client::new(),
+            url: supabase_url.clone(),
+            anon: anon_key.clone(),
+            service: service_key.clone(),
+            public: "http://auth.test".into(),
+            attempts: Arc::new(Mutex::new(HashMap::new())),
+            wrong_codes: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router(app)).await.unwrap() });
+        let http = reqwest::Client::new();
 
-        for (suffix, status, expiry) in [
-            ("A", "approved", "now() + interval '1 minute'"),
-            ("E", "approved", "now() - interval '1 minute'"),
-            ("D", "pending", "now() + interval '1 minute'"),
-            ("S", "pending", "now() + interval '1 minute'"),
-        ] {
-            let user_code = match suffix {
-                "A" => &approved_code,
-                "E" => &expired_code,
-                "D" => &denied_code,
-                _ => &slow_code,
-            };
-            let insert = format!(
-                "INSERT INTO device_logins (device_code_hash, user_code, status, expires_at)
-                 VALUES ($1, $2, $3, {})",
-                expiry
-            );
-            sqlx::query(&insert)
-                .bind(hash(user_code))
-                .bind(user_code)
-                .bind(status)
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-
-        let claim = || async {
-            sqlx::query_scalar::<_, String>(
-                "UPDATE device_logins
-                 SET status = 'used'
-                 WHERE device_code_hash = $1
-                   AND status = 'approved'
-                   AND expires_at > now()
-                 RETURNING user_code",
+        // A test user and a browser access token for it.
+        let email = format!("device-{}@example.com", &hash(&new_code())[..12]);
+        http.post(format!("{supabase_url}/auth/v1/admin/users"))
+            .header("apikey", &service_key)
+            .bearer_auth(&service_key)
+            .json(
+                &json!({"email": email, "password": "device-test-password", "email_confirm": true}),
             )
-            .bind(hash(&approved_code))
-            .fetch_optional(&pool)
+            .send()
             .await
             .unwrap()
-        };
-        let (first_claim, second_claim) = tokio::join!(claim(), claim());
-        assert_eq!(
-            usize::from(first_claim.is_some()) + usize::from(second_claim.is_some()),
-            1
-        );
-        let mut session_count = 0;
-        for claim_result in [first_claim, second_claim] {
-            if claim_result.is_some() {
-                create_supabase_session(
-                    &reqwest::Client::new(),
-                    &auth_server.uri(),
-                    "anon-key",
-                    "service-key",
-                    "integration@example.com",
-                )
-                .await
-                .unwrap();
-                session_count += 1;
+            .error_for_status()
+            .unwrap();
+        let browser: serde_json::Value = http
+            .post(format!("{supabase_url}/auth/v1/token?grant_type=password"))
+            .header("apikey", &anon_key)
+            .json(&json!({"email": email, "password": "device-test-password"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let browser_token = browser["access_token"].as_str().unwrap().to_owned();
+
+        let start_login = |ip: &'static str| {
+            let http = http.clone();
+            let base = base.clone();
+            async move {
+                http.post(format!("{base}/device"))
+                    .header("cf-connecting-ip", ip)
+                    .json(&json!({"client_info": "test"}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
             }
+        };
+        let poll_login = |device_code: String| {
+            let http = http.clone();
+            let base = base.clone();
+            async move {
+                let response = http
+                    .post(format!("{base}/device/token"))
+                    .json(&json!({"device_code": device_code}))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                (status, response.json::<serde_json::Value>().await.unwrap())
+            }
+        };
+        let send_choice = |route: &'static str, user_code: String| {
+            let http = http.clone();
+            let base = base.clone();
+            let browser_token = browser_token.clone();
+            async move {
+                http.post(format!("{base}/device/{route}"))
+                    .header("cf-connecting-ip", "192.0.2.10")
+                    .bearer_auth(browser_token)
+                    .json(&json!({"user_code": user_code}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        // Pending, then slow_down when the CLI polls too fast.
+        let started = start_login("192.0.2.1").await;
+        let device_code = started["device_code"].as_str().unwrap().to_owned();
+        let user_code = started["user_code"].as_str().unwrap().to_owned();
+        assert_eq!(
+            poll_login(device_code.clone()).await.0,
+            StatusCode::ACCEPTED
+        );
+        let (status, body) = poll_login(device_code.clone()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "slow_down");
+
+        // Approve, then two polls at the same time: exactly one gets a session.
+        assert_eq!(
+            send_choice("approve", user_code.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        sqlx::query("UPDATE device_logins SET last_poll_at = NULL WHERE user_code = $1")
+            .bind(&user_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            poll_login(device_code.clone()),
+            poll_login(device_code.clone())
+        );
+        let sessions: Vec<_> = [&first, &second]
+            .into_iter()
+            .filter(|(status, _)| *status == StatusCode::OK)
+            .collect();
+        assert_eq!(sessions.len(), 1, "first: {first:?}, second: {second:?}");
+        let session = &sessions[0].1;
+        assert_eq!(session["email"], email.as_str());
+        assert!(session["refresh_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()));
+        assert_ne!(session["access_token"], browser["access_token"]);
+
+        // Deny.
+        let started = start_login("192.0.2.2").await;
+        let denied_code = started["user_code"].as_str().unwrap().to_owned();
+        assert_eq!(
+            send_choice("deny", denied_code).await,
+            StatusCode::NO_CONTENT
+        );
+        let (status, body) = poll_login(started["device_code"].as_str().unwrap().into()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "access_denied");
+
+        // Expiry.
+        let started = start_login("192.0.2.3").await;
+        sqlx::query("UPDATE device_logins SET expires_at = now() - interval '1 second' WHERE user_code = $1")
+            .bind(started["user_code"].as_str().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, body) = poll_login(started["device_code"].as_str().unwrap().into()).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["error"], "expired_token");
+
+        // The fifth wrong code blocks the IP.
+        let mut last_status = StatusCode::OK;
+        for _ in 0..5 {
+            last_status = http
+                .post(format!("{base}/device/info"))
+                .header("cf-connecting-ip", "192.0.2.99")
+                .json(&json!({"user_code": "ZZZZ-ZZZZ"}))
+                .send()
+                .await
+                .unwrap()
+                .status();
         }
-        assert_eq!(session_count, 1);
+        assert_eq!(last_status, StatusCode::LOCKED);
 
-        let expired_claim = sqlx::query_scalar::<_, String>(
-            "UPDATE device_logins
-             SET status = 'used'
-             WHERE device_code_hash = $1
-               AND status = 'approved'
-               AND expires_at > now()
-             RETURNING user_code",
-        )
-        .bind(hash(&expired_code))
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-        assert!(expired_claim.is_none());
-
-        sqlx::query(
-            "UPDATE device_logins
-             SET status = 'denied'
-             WHERE user_code = $1 AND status = 'pending' AND expires_at > now()",
-        )
-        .bind(&denied_code)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let denied_status: String = sqlx::query_scalar(
-            "SELECT status
-             FROM device_logins
-             WHERE user_code = $1",
-        )
-        .bind(&denied_code)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(denied_status, "denied");
-
-        sqlx::query(
-            "UPDATE device_logins SET last_poll_at = now() - interval '2 seconds'
-             WHERE user_code = $1",
-        )
-        .bind(&slow_code)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let seconds_since_poll: i64 = sqlx::query_scalar(
-            "SELECT EXTRACT(EPOCH FROM now() - last_poll_at)::bigint
-             FROM device_logins WHERE user_code = $1",
-        )
-        .bind(&slow_code)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(should_slow_down(Some(seconds_since_poll)));
-
-        sqlx::query(
-            "DELETE FROM device_logins
-             WHERE user_code = ANY($1)",
-        )
-        .bind([&approved_code, &expired_code, &denied_code, &slow_code])
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("DELETE FROM auth.users WHERE email = $1")
+            .bind(&email)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -825,16 +864,7 @@ async fn main() {
         attempts: Arc::new(Mutex::new(HashMap::new())),
         wrong_codes: Arc::new(Mutex::new(HashMap::new())),
     });
-    let router = Router::new()
-        .route("/", get(page))
-        .route("/{user_code}", get(page))
-        .route("/device", post(start))
-        .route("/device/info", post(info))
-        .route("/device/approve", post(approve))
-        .route("/device/deny", post(deny))
-        .route("/device/token", post(poll))
-        .route("/livez", get(livez))
-        .with_state(app);
+    let router = router(app);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     axum::serve(listener, router).await.unwrap();
 }
