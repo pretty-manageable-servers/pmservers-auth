@@ -644,7 +644,7 @@ mod tests {
 
     /// Runs the real routes against local Supabase (`supabase start` in pmservers-api).
     #[tokio::test]
-    #[ignore = "requires local Supabase with 0010_device_logins.sql applied"]
+    #[ignore = "requires local Supabase with 20261011014640_device_logins.sql applied"]
     async fn local_supabase_device_login_end_to_end() {
         let setting = |name: &str| {
             std::env::var(name).unwrap_or_else(|_| panic!("set {name} for the local Supabase"))

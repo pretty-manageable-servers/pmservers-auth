@@ -4,7 +4,7 @@ This service gives `pms login` a device code flow. It uses Supabase Postgres and
 
 Required environment: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `DATABASE_URL`, and `PUBLIC_URL`.
 
-Apply migration `0010_device_logins.sql` from `pmservers-api/supabase/migrations` to the local Supabase project before starting this service. Run with `cargo run`. The service listens on port 8080 and exposes `/livez`.
+Apply migration `20261011014640_device_logins.sql` from `pmservers-api/supabase/migrations` to the local Supabase project before starting this service. Run with `cargo run`. The service listens on port 8080 and exposes `/livez`.
 
 Do not use the production Supabase project for local development. Keep the service role key in the pod secret only.
 
