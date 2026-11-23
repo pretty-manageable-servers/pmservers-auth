@@ -1,0 +1,19 @@
+# Egress to the on-prem API database. Cilium adds this to the policy pmservers-auth of the homelab repo
+# (apps/pmservers-auth-network), which allows only DNS and the internet.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: pmservers-auth-db
+  namespace: pms
+spec:
+  endpointSelector:
+    matchLabels:
+      app: pmservers-auth
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: pms
+            cnpg.io/cluster: pms-db
+      toPorts:
+        - ports:
+            - {port: "5432", protocol: TCP}
