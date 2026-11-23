@@ -201,6 +201,18 @@ async fn approve(
     let user_id = user["id"]
         .as_str()
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, err("invalid_token")))?;
+    // The API database has no auth schema: device_logins.user_id refers to the mirror pms.users.
+    // The user may approve before any API call made their row, so make it here.
+    sqlx::query(
+        "INSERT INTO pms.users (id, email, email_confirmed_at) VALUES ($1::uuid, $2, now())
+         ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email,
+           email_confirmed_at = coalesce(pms.users.email_confirmed_at, now())",
+    )
+    .bind(user_id)
+    .bind(user["email"].as_str())
+    .execute(&app.pool)
+    .await
+    .map_err(internal)?;
     let result = sqlx::query(
         "UPDATE device_logins
          SET user_id = $1::uuid, status = 'approved'
@@ -342,9 +354,9 @@ async fn poll(
     }
     if can_claim_session(&poll_state.0, is_expired(poll_state.2, poll_state.3)) {
         let user: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT device_logins.user_id::text, auth.users.email
+            "SELECT device_logins.user_id::text, pms.users.email
              FROM device_logins
-             LEFT JOIN auth.users ON auth.users.id = device_logins.user_id
+             LEFT JOIN pms.users ON pms.users.id = device_logins.user_id
              WHERE device_logins.device_code_hash = $1
                AND device_logins.status = 'approved'
                AND device_logins.expires_at > now()",
@@ -818,6 +830,11 @@ mod tests {
         }
         assert_eq!(last_status, StatusCode::LOCKED);
 
+        sqlx::query("DELETE FROM pms.users WHERE email = $1")
+            .bind(&email)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM auth.users WHERE email = $1")
             .bind(&email)
             .execute(&pool)
