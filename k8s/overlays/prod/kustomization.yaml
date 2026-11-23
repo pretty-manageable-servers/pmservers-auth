@@ -5,7 +5,7 @@ resources:
 images:
   - name: pmservers-auth
     newName: ghcr.io/pretty-manageable-servers/pmservers-auth
-    newTag: sha-b63405e6a9016fd4b2139c0b0179e724126c9c72
+    newTag: sha-3df932809178e9ee5aadce6c4899c4706eaf9ad0
 patches:
   - target: {kind: Deployment, name: pmservers-auth}
     patch: |-
